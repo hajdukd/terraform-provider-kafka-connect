@@ -2,14 +2,20 @@
 
 set -ex
 
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+stack="${repo_root}/bin/stack"
+
+cleanup() {
+  "$stack" down || true
+}
+trap cleanup EXIT
+
 go build
 mv terraform-provider-kafka-connect ~/.terraform.d/plugins/terraform-provider-kafka-connect
-docker compose down
-docker compose up -d
-sleep 60
+"$stack" down
+"$stack" up
 cd examples
 rm -rf .terraform terraform.tfstate*
 terraform init
 terraform plan
 terraform apply -auto-approve
-docker compose down

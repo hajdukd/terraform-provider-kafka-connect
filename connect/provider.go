@@ -71,9 +71,14 @@ func Provider() *schema.Provider {
 }
 
 func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
+	log.Printf("[INFO] kafka-connect provider (fork): masked/__internal-aware update wait enabled")
 	log.Printf("[INFO] Initializing KafkaConnect client")
 	addr := d.Get("url").(string)
 	c := kc.NewClient(addr)
+	// Kafka Connect injects runtime keys prefixed with "__internal." into the
+	// deployed config. Ignore them when polling IsUpToDate so connector updates
+	// do not time out waiting for an exact config match.
+	c.SetDisableInternalConfig(true)
 	user := d.Get("basic_auth_username").(string)
 	pass := d.Get("basic_auth_password").(string)
 	if user != "" && pass != "" {

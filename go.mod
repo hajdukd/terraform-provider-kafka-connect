@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	github.com/hashicorp/terraform-plugin-sdk/v2 v2.40.1
-	github.com/ricardo-ch/go-kafka-connect/v3 v3.0.0-20221117134721-e033f95963cb
+	github.com/ricardo-ch/go-kafka-connect/v3 v3.0.0-20260722124435-da817a6968a5
 	gopkg.in/resty.v1 v1.12.0
 )
 

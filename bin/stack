@@ -1,0 +1,362 @@
+#!/bin/bash
+# {genai:ten-times-developer}
+#
+# Local test stack for the kafka-connect Terraform provider, driven by Apple's
+# `container` CLI (https://github.com/apple/container) instead of Docker Compose.
+#
+# Usage:
+#   bin/stack up              start the stack and wait until it is ready
+#   bin/stack down            stop and remove the stack (idempotent)
+#   bin/stack status          show container state
+#   bin/stack logs <name>     follow logs of one service
+#
+# The configuration block below mirrors docker-compose.yaml.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration (kept in one place so it is easy to diff against compose)
+# ---------------------------------------------------------------------------
+
+# Confluent 5.3.1 images are linux/amd64 only and run via Rosetta on Apple
+# Silicon. Override with STACK_ARCH=arm64 on a host that has native images.
+STACK_ARCH="${STACK_ARCH:-amd64}"
+
+NETWORK_NAME="${STACK_NETWORK:-kafka-connect-test}"
+
+# Apple's `container` CLI rejects short image names ("invalid format for image
+# reference"); references must include the registry host.
+ZOOKEEPER_NAME="zookeeper"
+ZOOKEEPER_IMAGE="docker.io/confluentinc/cp-zookeeper:5.3.1"
+ZOOKEEPER_PORT="2181"
+
+KAFKA_NAME="kafka"
+KAFKA_IMAGE="docker.io/confluentinc/cp-kafka:5.3.1"
+KAFKA_PORT="9092"
+
+KAFKA_CONNECT_NAME="kafka-connect"
+KAFKA_CONNECT_IMAGE="docker.io/confluentinc/cp-kafka-connect:5.3.1"
+KAFKA_CONNECT_PORT="8083"
+
+NGINX_NAME="nginx"
+NGINX_IMAGE="docker.io/xscys/nginx-sidecar-basic-auth"
+NGINX_PORT="8087"
+BASIC_AUTH_USERNAME="testuser"
+BASIC_AUTH_PASSWORD="testpassword"
+
+# `container run` defaults to 1 GiB per container, which is too small for the
+# Kafka and Kafka Connect JVMs (Connect scans every bundled connector at
+# startup and is killed mid-boot at the default). 2 GiB gives them headroom.
+STACK_MEMORY="${STACK_MEMORY:-2G}"
+
+# Readiness polling. STACK_READY_TIMEOUT covers the whole wait; the interval
+# is how often we probe.
+READY_TIMEOUT="${STACK_READY_TIMEOUT:-180}"
+READY_INTERVAL="${STACK_READY_INTERVAL:-5}"
+
+SERVICES=("$ZOOKEEPER_NAME" "$KAFKA_NAME" "$KAFKA_CONNECT_NAME" "$NGINX_NAME")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+log() {
+  printf '==> %s\n' "$*"
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+# container_ip <name>
+#
+# Apple's `container` CLI has no Docker-style embedded DNS: a container is only
+# resolvable by name from itself (its own /etc/hosts entry), never from its
+# peers. Dependents therefore get the upstream container's address as a literal
+# IP, read from `container inspect` once the container is running.
+#
+# `container inspect` emits a JSON array; the address lives at
+# .status.networks[].ipv4Address and carries a CIDR suffix (e.g.
+# "192.168.66.2/24") which we strip. jq is preferred; python3 is the fallback.
+container_ip() {
+  local name="$1"
+  local json ip
+
+  json="$(container inspect "$name")"
+
+  if command -v jq >/dev/null 2>&1; then
+    ip="$(printf '%s' "$json" | jq -r --arg name "$name" '
+      .[] | select(.id == $name) | .status.networks[]
+      | select(.ipv4Address != null) | .ipv4Address' | head -n 1)"
+  elif command -v python3 >/dev/null 2>&1; then
+    ip="$(printf '%s' "$json" | python3 -c '
+import json, sys
+name = sys.argv[1]
+for item in json.load(sys.stdin):
+    if item.get("id") != name:
+        continue
+    for net in item.get("status", {}).get("networks", []):
+        addr = net.get("ipv4Address")
+        if addr:
+            print(addr)
+            sys.exit(0)
+sys.exit(1)
+' "$name")"
+  else
+    die "neither jq nor python3 is available to parse 'container inspect' output"
+  fi
+
+  ip="${ip%%/*}"
+  if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    die "could not determine an IPv4 address for container '$name' (got: '${ip:-<empty>}')"
+  fi
+  printf '%s' "$ip"
+}
+
+# now_epoch — seconds since the epoch. `SECONDS` is not a reliable timer on
+# macOS's stock bash 3.2, so readiness deadlines are computed from `date`.
+now_epoch() {
+  date +%s
+}
+
+# wait_for <description> <timeout-seconds> <command...>
+wait_for() {
+  local description="$1" timeout="$2"
+  shift 2
+  local deadline=$(($(now_epoch) + timeout))
+
+  log "waiting for ${description} (timeout ${timeout}s)"
+  while [[ "$(now_epoch)" -lt "$deadline" ]]; do
+    if "$@" >/dev/null 2>&1; then
+      log "${description} is ready"
+      return 0
+    fi
+    sleep "$READY_INTERVAL"
+  done
+  die "timed out after ${timeout}s waiting for ${description}"
+}
+
+container_exists() {
+  container inspect "$1" >/dev/null 2>&1
+}
+
+network_exists() {
+  local found
+  found="$(container network list --format json | jq -r --arg name "$1" 'any(.[]; .id == $name)')"
+  [[ "$found" == "true" ]]
+}
+
+ensure_system() {
+  local status
+  status="$(container system status --format json | jq -r '.status')"
+  if [[ "$status" != "running" ]]; then
+    log "container system service is '$status'; starting it"
+    container system start
+  fi
+}
+
+ensure_network() {
+  if network_exists "$NETWORK_NAME"; then
+    log "network '$NETWORK_NAME' already exists"
+    return 0
+  fi
+  log "creating network '$NETWORK_NAME'"
+  container network create "$NETWORK_NAME" >/dev/null
+}
+
+# run_service <name> <image> <port> [extra container-run args...] -- [command...]
+#
+# Everything before the "--" separator is a flag for `container run`; everything
+# after it is the container's command. The separator is required because this
+# CLI does not accept "--" on its own command line — it treats a bare "--" as
+# an image reference ("invalid format for image reference") — so the command
+# arguments must be placed directly after the image name.
+run_service() {
+  local name="$1" image="$2" port="$3"
+  shift 3
+
+  local -a run_args=() cmd_args=()
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--" ]]; then
+      shift
+      cmd_args=("$@")
+      break
+    fi
+    run_args+=("$1")
+    shift
+  done
+
+  if container_exists "$name"; then
+    die "container '$name' already exists; run 'bin/stack down' first"
+  fi
+
+  log "starting $name ($image)"
+  # ${arr[@]+...} guards the expansion: bash 3.2 treats an empty array as an
+  # unbound variable under `set -u`.
+  container run -d \
+    --name "$name" \
+    --network "$NETWORK_NAME" \
+    --arch "$STACK_ARCH" \
+    --memory "$STACK_MEMORY" \
+    --publish "${port}:${port}" \
+    ${run_args[@]+"${run_args[@]}"} \
+    "$image" \
+    ${cmd_args[@]+"${cmd_args[@]}"} >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_up() {
+  ensure_system
+  ensure_network
+
+  # zookeeper has no dependencies.
+  run_service "$ZOOKEEPER_NAME" "$ZOOKEEPER_IMAGE" "$ZOOKEEPER_PORT" \
+    --env "ZOOKEEPER_CLIENT_PORT=${ZOOKEEPER_PORT}" \
+    --env "ZOOKEEPER_TICK_TIME=2000"
+  local zookeeper_ip
+  zookeeper_ip="$(container_ip "$ZOOKEEPER_NAME")"
+  log "zookeeper is at ${zookeeper_ip}"
+
+  # kafka: peers cannot resolve this container's name, and its own IP is not
+  # known until it has booted, so it cannot be injected up front. Instead the
+  # entrypoint is wrapped so the broker advertises whatever `hostname -i`
+  # reports for itself (verified to return the container's network IP).
+  # shellcheck disable=SC2016
+  # $(hostname -i) must be evaluated inside the container, not on the host, so
+  # it stays single-quoted; only the port is expanded here.
+  local kafka_entrypoint='export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://$(hostname -i):'"${KAFKA_PORT}"'"; exec /etc/confluent/docker/run'
+  run_service "$KAFKA_NAME" "$KAFKA_IMAGE" "$KAFKA_PORT" \
+    --env "KAFKA_BROKER_ID=1" \
+    --env "KAFKA_ZOOKEEPER_CONNECT=${zookeeper_ip}:${ZOOKEEPER_PORT}" \
+    --env "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1" \
+    --entrypoint /bin/bash \
+    -- -c "$kafka_entrypoint"
+  local kafka_ip
+  kafka_ip="$(container_ip "$KAFKA_NAME")"
+  log "kafka is at ${kafka_ip}"
+
+  run_service "$KAFKA_CONNECT_NAME" "$KAFKA_CONNECT_IMAGE" "$KAFKA_CONNECT_PORT" \
+    --env "CONNECT_BOOTSTRAP_SERVERS=PLAINTEXT://${kafka_ip}:${KAFKA_PORT}" \
+    --env "CONNECT_GROUP_ID=connect" \
+    --env "CONNECT_REST_PORT=${KAFKA_CONNECT_PORT}" \
+    --env "CONNECT_CONFIG_STORAGE_TOPIC=quickstart-config" \
+    --env "CONNECT_OFFSET_STORAGE_TOPIC=quickstart-offsets" \
+    --env "CONNECT_STATUS_STORAGE_TOPIC=quickstart-status" \
+    --env "CONNECT_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter" \
+    --env "CONNECT_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter" \
+    --env "CONNECT_INTERNAL_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter" \
+    --env "CONNECT_INTERNAL_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter" \
+    --env "CONNECT_REST_ADVERTISED_HOST_NAME=localhost" \
+    --env "CONNECT_PLUGIN_PATH=/usr/share/java" \
+    --env "CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR=1" \
+    --env "CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR=1" \
+    --env "CONNECT_STATUS_STORAGE_REPLICATION_FACTOR=1"
+  local kafka_connect_ip
+  kafka_connect_ip="$(container_ip "$KAFKA_CONNECT_NAME")"
+  log "kafka-connect is at ${kafka_connect_ip}"
+
+  run_service "$NGINX_NAME" "$NGINX_IMAGE" "$NGINX_PORT" \
+    --env "FORWARD_HOST=${kafka_connect_ip}" \
+    --env "FORWARD_PORT=${KAFKA_CONNECT_PORT}" \
+    --env "BASIC_AUTH_USERNAME=${BASIC_AUTH_USERNAME}" \
+    --env "BASIC_AUTH_PASSWORD=${BASIC_AUTH_PASSWORD}"
+
+  wait_for "kafka-connect REST on localhost:${KAFKA_CONNECT_PORT}" "$READY_TIMEOUT" \
+    curl -sf "http://localhost:${KAFKA_CONNECT_PORT}/"
+  wait_for "nginx basic auth on localhost:${NGINX_PORT}" "$READY_TIMEOUT" \
+    curl -sf -u "${BASIC_AUTH_USERNAME}:${BASIC_AUTH_PASSWORD}" "http://localhost:${NGINX_PORT}/"
+
+  log "stack is up"
+}
+
+# remove_container <name> — never fails when the container is absent.
+remove_container() {
+  local name="$1"
+  if container_exists "$name"; then
+    log "removing $name"
+    container stop "$name" >/dev/null 2>&1 || true
+    container delete --force "$name" >/dev/null
+  fi
+}
+
+cmd_down() {
+  local name
+  # Tear down in reverse startup order.
+  for name in "$NGINX_NAME" "$KAFKA_CONNECT_NAME" "$KAFKA_NAME" "$ZOOKEEPER_NAME"; do
+    remove_container "$name"
+  done
+
+  if network_exists "$NETWORK_NAME"; then
+    log "removing network '$NETWORK_NAME'"
+    container network delete "$NETWORK_NAME" >/dev/null
+  fi
+  log "stack is down"
+}
+
+cmd_status() {
+  local name found=0
+  for name in "${SERVICES[@]}"; do
+    if container_exists "$name"; then
+      found=1
+      container list --all --format json \
+        | jq -r --arg name "$name" '
+            .[] | select(.id == $name)
+            | "\(.id)\t\(.status.state)\t\(.configuration.image.reference)"'
+    else
+      printf '%s\t%s\n' "$name" "absent"
+    fi
+  done
+  if ((found == 0)); then
+    log "no stack containers are present"
+  fi
+}
+
+cmd_logs() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: bin/stack logs <zookeeper|kafka|kafka-connect|nginx>"
+  container_exists "$name" || die "container '$name' does not exist"
+  container logs --follow "$name"
+}
+
+usage() {
+  cat <<EOF
+Usage: bin/stack <command>
+
+Commands:
+  up              start zookeeper, kafka, kafka-connect and nginx, then wait
+                  until kafka-connect and nginx answer
+  down            stop and remove the stack (safe to run when nothing exists)
+  status          show the state of each stack container
+  logs <name>     follow the logs of one stack container
+
+Environment:
+  STACK_ARCH            image architecture (default: amd64, required for the
+                        linux/amd64-only Confluent 5.3.1 images)
+  STACK_MEMORY          memory per container (default: 2G; the 1G default of
+                        container run is too small for the Connect JVM)
+  STACK_NETWORK         container network name (default: kafka-connect-test)
+  STACK_READY_TIMEOUT   seconds to wait for each readiness check (default: 180)
+  STACK_READY_INTERVAL  seconds between readiness probes (default: 5)
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    up) cmd_up ;;
+    down) cmd_down ;;
+    status) cmd_status ;;
+    logs) shift; cmd_logs "$@" ;;
+    -h | --help | help) usage ;;
+    "") usage; exit 1 ;;
+    *) die "unknown command '$cmd' (try: bin/stack --help)" ;;
+  esac
+}
+
+main "$@"
+
+# {genai:jarvis}

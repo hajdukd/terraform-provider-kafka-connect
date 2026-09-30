@@ -9,7 +9,10 @@ build:
 test:
 	go test ./...
 
-testacc:
-	KAFKA_CONNECT_URL=http://localhost:8083 TF_LOG=debug TF_ACC=1 go test $(TEST) -v $(TESTARGS) -timeout 120m
+install-local:
+	./bin/install-local --arch all
 
-.PHONY: build test testacc
+upload-provider:
+	./bin/upload-provider
+
+.PHONY: build test install-local upload-provider

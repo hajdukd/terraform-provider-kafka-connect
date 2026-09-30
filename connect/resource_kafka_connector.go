@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -89,9 +90,10 @@ func connectorCreate(d *schema.ResourceData, meta interface{}) error {
 	fmt.Printf("[INFO] Created the connector %v\n", connectorResponse)
 
 	if err == nil {
-		newConfFiltered := removeSecondKeysFromFirst(connectorResponse.Config, sensitiveCache)
+		newConfFiltered := stripInternalConfig(removeSecondKeysFromFirst(connectorResponse.Config, sensitiveCache))
+		newConfFiltered = preserveMaskedLocalValues(newConfFiltered, config)
 		d.SetId(name)
-		d.Set("config_sensitive", sensitiveCache)
+		d.Set("config_sensitive", stripInternalConfig(sensitiveCache))
 		d.Set("config", newConfFiltered)
 	}
 
@@ -146,23 +148,17 @@ func connectorUpdate(d *schema.ResourceData, meta interface{}) error {
 	}
 
 	log.Printf("[INFO] Looking for %s", name)
-	var conn kc.ConnectorResponse
-	var err error
-	err = withRebalanceRetry(func() error {
-		conn, err = c.UpdateConnector(req, true)
-		return err
+	// sync=false: the client sync compare requires an exact whole-map match and
+	// times out when Connect masks passwords or injects __internal keys.
+	err := withRebalanceRetry(func() error {
+		_, updateErr := c.UpdateConnector(req, false)
+		return updateErr
 	}, d.Timeout(schema.TimeoutUpdate))
-
-	if err == nil {
-		newConfFiltered := removeSecondKeysFromFirst(conn.Config, sensitiveCache)
-		//log.Printf("[INFO] Full config received from update is: %v", conn.Config)
-		log.Printf("[INFO] Local config nonsensitive updated to: %v", newConfFiltered)
-		//log.Printf("[INFO] Local config_sensitive updated to:  %v", sensitiveCache)
-		d.Set("config", newConfFiltered)
-		d.Set("config_sensitive", sensitiveCache)
+	if err != nil {
+		return err
 	}
 
-	if err != nil {
+	if err := waitForConfigApplied(c, name, config, sensitiveCache, d.Timeout(schema.TimeoutUpdate)); err != nil {
 		return err
 	}
 
@@ -189,8 +185,9 @@ func connectorRead(d *schema.ResourceData, meta interface{}) error {
 
 	// we do not want the sensitive values to appear in the non-masked 'config' field
 	// use cached sensitive values to get the correct keys to remove from the newly read config
-	newConfFiltered := removeSecondKeysFromFirst(conn.Config, sensitiveCache)
-	d.Set("config_sensitive", sensitiveCache)
+	newConfFiltered := stripInternalConfig(removeSecondKeysFromFirst(conn.Config, sensitiveCache))
+	newConfFiltered = preserveMaskedLocalValues(newConfFiltered, config)
+	d.Set("config_sensitive", stripInternalConfig(sensitiveCache))
 	d.Set("config", newConfFiltered)
 	log.Printf("[INFO] Local config nonsensitive data updated to %v", newConfFiltered)
 	//log.Printf("[INFO] Local config_sensitive data updated to %v", sensitiveCache)
@@ -259,7 +256,7 @@ func isRebalanceError(err error) bool {
 func configFromRD(d *schema.ResourceData) (map[string]interface{}, map[string]interface{}) {
 	cfg := mapFromRD(d, "config")
 	scfg := mapFromRD(d, "config_sensitive")
-	config := combineMaps(cfg, scfg)
+	config := stripInternalConfig(combineMaps(cfg, scfg))
 	return config, scfg
 }
 
@@ -288,4 +285,131 @@ func removeSecondKeysFromFirst(first map[string]interface{}, second map[string]i
 		delete(first, k)
 	}
 	return first
+}
+
+// isMaskedValue reports whether the string form of v is a non-empty masked
+// placeholder. Kafka Connect may return password fields as a run of '•'
+// (U+2022), a run of '*', or the exact string "[hidden]".
+func isMaskedValue(v interface{}) bool {
+	s := fmt.Sprintf("%v", v)
+	if s == "" {
+		return false
+	}
+	if s == "[hidden]" {
+		return true
+	}
+	onlyBullet := true
+	onlyStar := true
+	for _, r := range s {
+		if r != '\u2022' {
+			onlyBullet = false
+		}
+		if r != '*' {
+			onlyStar = false
+		}
+		if !onlyBullet && !onlyStar {
+			return false
+		}
+	}
+	return onlyBullet || onlyStar
+}
+
+// configMismatches returns sorted keys from desired that are missing or
+// different in deployed. Keys prefixed with "__internal", keys present in
+// ignoreKeys, and keys whose deployed value is masked are skipped. Keys that
+// exist only in deployed are ignored. The result contains key names only.
+func configMismatches(desired, deployed map[string]interface{}, ignoreKeys map[string]interface{}) []string {
+	var mismatched []string
+	for k, want := range desired {
+		if strings.HasPrefix(k, "__internal") {
+			continue
+		}
+		if _, skip := ignoreKeys[k]; skip {
+			continue
+		}
+		got, ok := deployed[k]
+		if !ok {
+			mismatched = append(mismatched, k)
+			continue
+		}
+		if isMaskedValue(got) {
+			continue
+		}
+		if fmt.Sprintf("%v", want) != fmt.Sprintf("%v", got) {
+			mismatched = append(mismatched, k)
+		}
+	}
+	sort.Strings(mismatched)
+	return mismatched
+}
+
+// waitForConfigApplied polls GetConnectorConfig until the keys we sent match
+// the deployed config. Masked values, sensitive keys, and __internal keys are
+// ignored. Rebalance errors are transient; other errors are returned
+// immediately. On timeout the error lists mismatched key names only.
+func waitForConfigApplied(c kc.HighLevelClient, name string, desired, sensitive map[string]interface{}, timeout time.Duration) error {
+	const pollInterval = time.Second
+
+	deadline := time.Now().Add(timeout)
+	var mismatched []string
+	for {
+		resp, err := c.GetConnectorConfig(kc.ConnectorRequest{Name: name})
+		if err != nil {
+			if !isRebalanceError(err) {
+				return err
+			}
+			log.Printf("[INFO] Connect rebalance in progress while waiting for connector %s config; retrying (%v)", name, err)
+		} else {
+			mismatched = configMismatches(desired, resp.Config, sensitive)
+			if len(mismatched) == 0 {
+				return nil
+			}
+			log.Printf("[INFO] Connector %s config not yet applied; mismatched keys: %v", name, mismatched)
+		}
+
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("connector %s config not applied within %s; mismatched keys: %v", name, timeout, mismatched)
+		}
+
+		sleep := pollInterval
+		if remaining := time.Until(deadline); remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+	}
+}
+
+// preserveMaskedLocalValues keeps the local value for any deployed key whose
+// value is a mask, so a later plan does not replace a real config value with
+// '•', '*', or "[hidden]". Keys absent from local are left unchanged.
+func preserveMaskedLocalValues(deployed, local map[string]interface{}) map[string]interface{} {
+	if deployed == nil || local == nil {
+		return deployed
+	}
+	for k, v := range deployed {
+		if !isMaskedValue(v) {
+			continue
+		}
+		if lv, ok := local[k]; ok {
+			deployed[k] = lv
+		}
+	}
+	return deployed
+}
+
+// stripInternalConfig returns a shallow copy of m with Kafka Connect runtime
+// keys removed. Keys prefixed by "__internal" cover both "__internal." and the
+// bare "__internal" key. The input map is not mutated.
+func stripInternalConfig(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	filtered := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		if strings.HasPrefix(k, "__internal") {
+			continue
+		}
+		filtered[k] = v
+	}
+	return filtered
 }

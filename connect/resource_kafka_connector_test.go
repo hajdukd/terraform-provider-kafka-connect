@@ -3,6 +3,7 @@ package connect
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,6 +155,294 @@ resource "kafka-connect_connector" "test_timeouts" {
   }
 }
 `
+
+func TestStripInternalConfig(t *testing.T) {
+	input := map[string]interface{}{
+		"name":                      "sqlite-sink",
+		"connector.class":           "io.confluent.connect.jdbc.JdbcSinkConnector",
+		"tasks.max":                 "2",
+		"__internal.config.version": "1",
+		"__internal.foo":            "bar",
+		"__internal":                "bare",
+	}
+
+	got := stripInternalConfig(input)
+
+	if _, ok := got["__internal.config.version"]; ok {
+		t.Errorf("__internal.config.version should be dropped, got %v", got["__internal.config.version"])
+	}
+	if _, ok := got["__internal.foo"]; ok {
+		t.Errorf("__internal.foo should be dropped, got %v", got["__internal.foo"])
+	}
+	if _, ok := got["__internal"]; ok {
+		t.Errorf("__internal should be dropped, got %v", got["__internal"])
+	}
+	if got["name"] != "sqlite-sink" {
+		t.Errorf("name should be kept, got %v", got["name"])
+	}
+	if got["connector.class"] != "io.confluent.connect.jdbc.JdbcSinkConnector" {
+		t.Errorf("connector.class should be kept, got %v", got["connector.class"])
+	}
+	if got["tasks.max"] != "2" {
+		t.Errorf("tasks.max should be kept, got %v", got["tasks.max"])
+	}
+	if len(got) != 3 {
+		t.Errorf("expected 3 remaining keys, got %d (%v)", len(got), got)
+	}
+
+	if _, ok := input["__internal.config.version"]; !ok {
+		t.Errorf("input map was mutated: __internal.config.version missing")
+	}
+	if _, ok := input["__internal.foo"]; !ok {
+		t.Errorf("input map was mutated: __internal.foo missing")
+	}
+	if len(input) != 6 {
+		t.Errorf("input map was mutated: expected 6 keys, got %d", len(input))
+	}
+}
+
+func TestIsMaskedValue(t *testing.T) {
+	cases := []struct {
+		name string
+		v    interface{}
+		want bool
+	}{
+		{name: "bullets", v: "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", want: true},
+		{name: "single bullet", v: "\u2022", want: true},
+		{name: "stars", v: "********", want: true},
+		{name: "single star", v: "*", want: true},
+		{name: "hidden", v: "[hidden]", want: true},
+		{name: "empty", v: "", want: false},
+		{name: "plaintext", v: "s3cret", want: false},
+		{name: "mixed masks", v: "\u2022*", want: false},
+		{name: "hidden with suffix", v: "[hidden] ", want: false},
+		{name: "hidden case", v: "[HIDDEN]", want: false},
+		{name: "number", v: 1, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isMaskedValue(tc.v); got != tc.want {
+				t.Errorf("isMaskedValue(%#v) = %v, want %v", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfigMismatches(t *testing.T) {
+	t.Run("skips __internal keys", func(t *testing.T) {
+		desired := map[string]interface{}{
+			"name":                      "sqlite-sink",
+			"__internal.config.version": "1",
+			"__internal":                "local",
+		}
+		deployed := map[string]interface{}{
+			"name":                      "sqlite-sink",
+			"__internal.config.version": "99",
+		}
+		got := configMismatches(desired, deployed, nil)
+		if len(got) != 0 {
+			t.Errorf("expected no mismatches, got %v", got)
+		}
+	})
+
+	t.Run("skips sensitive keys", func(t *testing.T) {
+		desired := map[string]interface{}{
+			"name":              "sqlite-sink",
+			"database.password": "s3cret",
+		}
+		deployed := map[string]interface{}{
+			"name":              "sqlite-sink",
+			"database.password": "different-and-not-masked",
+		}
+		ignore := map[string]interface{}{
+			"database.password": "s3cret",
+		}
+		got := configMismatches(desired, deployed, ignore)
+		if len(got) != 0 {
+			t.Errorf("expected sensitive key to be skipped, got %v", got)
+		}
+	})
+
+	t.Run("skips masked deployed values", func(t *testing.T) {
+		desired := map[string]interface{}{
+			"name":              "sqlite-sink",
+			"database.password": "s3cret",
+			"api.key":           "real-key",
+		}
+		deployed := map[string]interface{}{
+			"name":              "sqlite-sink",
+			"database.password": "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022",
+			"api.key":           "[hidden]",
+		}
+		got := configMismatches(desired, deployed, nil)
+		if len(got) != 0 {
+			t.Errorf("expected masked values to be skipped, got %v", got)
+		}
+	})
+
+	t.Run("detects a real diff", func(t *testing.T) {
+		desired := map[string]interface{}{
+			"name":      "sqlite-sink",
+			"tasks.max": "2",
+			"topics":    "orders",
+			"missing":   "x",
+		}
+		deployed := map[string]interface{}{
+			"name":      "sqlite-sink",
+			"tasks.max": "1",
+			"topics":    "orders",
+		}
+		got := configMismatches(desired, deployed, nil)
+		want := []string{"missing", "tasks.max"}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("ignores deployed-only keys", func(t *testing.T) {
+		desired := map[string]interface{}{
+			"name":      "sqlite-sink",
+			"tasks.max": "1",
+		}
+		deployed := map[string]interface{}{
+			"name":                      "sqlite-sink",
+			"tasks.max":                 "1",
+			"__internal.config.version": "7",
+			"server.only":               "ignore-me",
+		}
+		got := configMismatches(desired, deployed, nil)
+		if len(got) != 0 {
+			t.Errorf("expected deployed-only keys to be ignored, got %v", got)
+		}
+	})
+}
+
+type fakeHighLevelClient struct {
+	kc.HighLevelClient
+	getConfig func(kc.ConnectorRequest) (kc.GetConnectorConfigResponse, error)
+}
+
+func (f *fakeHighLevelClient) GetConnectorConfig(req kc.ConnectorRequest) (kc.GetConnectorConfigResponse, error) {
+	return f.getConfig(req)
+}
+
+func TestWaitForConfigApplied(t *testing.T) {
+	t.Run("success despite masked password", func(t *testing.T) {
+		client := &fakeHighLevelClient{
+			getConfig: func(req kc.ConnectorRequest) (kc.GetConnectorConfigResponse, error) {
+				if req.Name != "sqlite-sink" {
+					t.Errorf("unexpected connector name %q", req.Name)
+				}
+				return kc.GetConnectorConfigResponse{
+					Config: map[string]interface{}{
+						"name":                      "sqlite-sink",
+						"tasks.max":                 "1",
+						"database.password":         "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022",
+						"__internal.config.version": "7",
+					},
+				}, nil
+			},
+		}
+		desired := map[string]interface{}{
+			"name":              "sqlite-sink",
+			"tasks.max":         "1",
+			"database.password": "s3cret",
+		}
+		err := waitForConfigApplied(client, "sqlite-sink", desired, nil, time.Second)
+		if err != nil {
+			t.Fatalf("expected success despite masked password, got %v", err)
+		}
+	})
+
+	t.Run("rebalance error followed by success", func(t *testing.T) {
+		calls := 0
+		client := &fakeHighLevelClient{
+			getConfig: func(req kc.ConnectorRequest) (kc.GetConnectorConfigResponse, error) {
+				calls++
+				if calls == 1 {
+					return kc.GetConnectorConfigResponse{}, errors.New("rebalance in progress")
+				}
+				return kc.GetConnectorConfigResponse{
+					Config: map[string]interface{}{
+						"name":      "sqlite-sink",
+						"tasks.max": "1",
+					},
+				}, nil
+			},
+		}
+		desired := map[string]interface{}{
+			"name":      "sqlite-sink",
+			"tasks.max": "1",
+		}
+		start := time.Now()
+		err := waitForConfigApplied(client, "sqlite-sink", desired, nil, 3*time.Second)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("expected success after rebalance, got %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("expected 2 polls, got %d", calls)
+		}
+		if elapsed < time.Second {
+			t.Fatalf("expected a poll interval before retry, elapsed %v", elapsed)
+		}
+	})
+
+	t.Run("timeout lists mismatched key names", func(t *testing.T) {
+		const secret = "super-secret-password"
+		client := &fakeHighLevelClient{
+			getConfig: func(req kc.ConnectorRequest) (kc.GetConnectorConfigResponse, error) {
+				return kc.GetConnectorConfigResponse{
+					Config: map[string]interface{}{
+						"name":      "sqlite-sink",
+						"tasks.max": "not-applied",
+						"topics":    secret,
+					},
+				}, nil
+			},
+		}
+		desired := map[string]interface{}{
+			"name":      "sqlite-sink",
+			"tasks.max": "1",
+			"topics":    "orders",
+		}
+		err := waitForConfigApplied(client, "sqlite-sink", desired, nil, 20*time.Millisecond)
+		if err == nil {
+			t.Fatal("expected timeout error")
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "connector sqlite-sink config not applied within") {
+			t.Errorf("unexpected error %q", msg)
+		}
+		if !strings.Contains(msg, "mismatched keys: [tasks.max topics]") {
+			t.Errorf("expected sorted key names in error, got %q", msg)
+		}
+		if strings.Contains(msg, secret) || strings.Contains(msg, "not-applied") || strings.Contains(msg, "orders") {
+			t.Errorf("error must not include config values, got %q", msg)
+		}
+	})
+
+	t.Run("non-rebalance error is returned immediately", func(t *testing.T) {
+		calls := 0
+		client := &fakeHighLevelClient{
+			getConfig: func(req kc.ConnectorRequest) (kc.GetConnectorConfigResponse, error) {
+				calls++
+				return kc.GetConnectorConfigResponse{}, errors.New("connection timeout")
+			},
+		}
+		start := time.Now()
+		err := waitForConfigApplied(client, "sqlite-sink", map[string]interface{}{"name": "sqlite-sink"}, nil, 5*time.Second)
+		if err == nil || err.Error() != "connection timeout" {
+			t.Fatalf("expected connection timeout, got %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("expected 1 poll, got %d", calls)
+		}
+		if time.Since(start) > time.Second {
+			t.Fatalf("non-rebalance error should not wait, elapsed %v", time.Since(start))
+		}
+	})
+}
 
 func TestIsRebalanceError(t *testing.T) {
 	rebalanceErr := errors.New("rebalance in progress")
