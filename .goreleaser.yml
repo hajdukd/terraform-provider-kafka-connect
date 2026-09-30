@@ -10,14 +10,8 @@ builds:
       - darwin
     goarch:
       - amd64
-      - 386
-      - arm
       - arm64
-    goarm:
-      - 7
     ignore:
-      - goos: darwin
-        goarch: '386'
       - goos: freebsd
         goarch: 'arm64'
       - goos: windows

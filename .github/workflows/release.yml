@@ -32,7 +32,6 @@ jobs:
         with:
           version: "~> v2"
           args: release --clean
-          key: ${{ secrets.YOUR_PRIVATE_KEY }}
         env:
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
