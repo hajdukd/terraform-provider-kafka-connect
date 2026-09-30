@@ -10,9 +10,9 @@ test:
 	go test ./...
 
 install-local:
-	./bin/install-local --arch all
+	./xtest/install-local --arch all
 
 upload-provider:
-	./bin/upload-provider
+	./xtest/upload-provider
 
 .PHONY: build test install-local upload-provider
